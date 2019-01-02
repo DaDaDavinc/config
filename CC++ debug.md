@@ -28,7 +28,7 @@ Contents
 | :------- | ------------------------------------------------------------ |
 | 编辑     | **vim**/emacs/vscode + plugins                               |
 | 调试     | **gdb** / **log** /**valgrind** / **cppcheck** / file / nm / ldd 等 |
-| 编译     | gcc / **g++ **/ cmake / **makefile** / clang 等              |
+| 编译     | gcc / **g++**/ cmake / **makefile** / clang 等               |
 | 链接     | link                                                         |
 | 远程调试 | gdb-server / ssh?                                            |
 | 脚本     | shell                                                        |
