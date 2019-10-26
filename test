@@ -1,0 +1,1198 @@
+#pragma once CInfiHandleMap g_mapPlatform
+#include "stdafx.h"
+#include "DeviceItem.h"
+#include "PlayChannel.h"
+#include <future>
+
+using namespace _COMMON;
+
+#define DEBUG_ALARM					    //MYTRACE
+#define DEBUG_DEVICE_ITEM				//MYTRACE
+#define DEBUG_PTZ						//MYTRACE
+
+#define MAX_NVD_COUNT 10 // NVD设备最多搜索个数
+#define MAX_MATRIX_WIDTH  8192
+#define MAX_MATRIX_HEIGHT 8192
+
+LONG CDeviceItem::m_lStaticCount = 0;
+
+Invoker g_invoker = Unknown;
+
+CInfiHandleMap g_mapPlatform(100);
+CSimpleCritical g_lockPlatform;
+
+CInfiHandleMap g_mapSearchDev(100);
+CSimpleCritical g_lockSearchDev;
+
+extern funcExceptionCallBack g_pExceptionCallBack;
+extern void *g_pUser;
+
+CDeviceItem::CDeviceItem(const char *szDevIP, int szDevPort, const char *szUserName,
+	const char *szPassword, std::string strDeviceID, LONG lUserID, ZLNET_DEVICEINFO_V30 *pInfo)
+	: m_strDevIP(szDevIP)
+	, m_nDevPort(szDevPort)
+	, m_strUserName(szUserName)
+	, m_strPassword(szPassword)
+	, m_strDeviceID(strDeviceID)
+	, m_lLoginHandle(lUserID)
+	, m_pMatrixCfg(NULL)
+	, m_pScene(NULL)
+{
+	int iError = 0;
+	m_lRef = 0;
+	m_hHandle = 0;
+	m_bIsOnline = false;
+	m_bInitDeviceInfo = false;
+	memset(&m_struDevInfo, 0, sizeof(ZLNET_DEVICEINFO_V30));
+	memcpy(&m_struDevInfo, pInfo, sizeof(ZLNET_DEVICEINFO_V30));
+
+	m_pVideoCfg = NULL;
+	::InterlockedIncrement(&m_lStaticCount);
+}
+
+CDeviceItem::~CDeviceItem(void)
+{
+	if (m_lLoginHandle != 0)
+	{
+		if (!ZLNET_Logout(m_lLoginHandle))
+		{
+			LOG_INFO("ZLNET_Logout failed. error code: %d", ZLNET_GetLastError());
+		}
+		m_lLoginHandle = 0;
+	}
+	::InterlockedDecrement(&m_lStaticCount);
+	LOG_INFO("Close device handle:%d, ip:%s", m_lLoginHandle, m_strDevIP.c_str());
+}
+
+LONG CDeviceItem::AddRef()
+{
+	LONG lRef = ::InterlockedIncrement(&m_lRef);
+	return lRef;
+}
+
+void CDeviceItem::Release()
+{
+	LONG lRef = ::InterlockedDecrement(&m_lRef);
+	if (lRef == 0)
+	{
+		delete this;
+	}
+}
+
+LONG CDeviceItem::OpenDevice(LPCSTR szDeviceParam, CDeviceItem** ppDeviceItem)
+{
+	LONG lResult = S_FALSE;
+	// 解析参数获取设备连接参数
+	LONG lUserID;
+	Json::Reader reader;
+	Json::Value value;
+
+	std::string strDevIP;
+	std::string strUserName;
+	std::string strPassword;
+	std::string strDeviceID;
+	int nPort = 0;
+	if (reader.parse(szDeviceParam, value))
+	{
+		nPort = value[DEVICE_PORT].asInt();
+		strDevIP = value[DEVICE_IP].asString();
+		strUserName = value[DEVICE_USERNAME].asString();
+		strPassword = value[DEVICE_PASSWORD].asString();
+		strDeviceID = value[KEY_SOURCE_ID].asString();
+	}
+	else
+	{
+		LOG_INFO("OpenDevice failed-param parse error [param: %s].", szDeviceParam);
+		return S_FALSE;
+	}
+
+	if (0 == nPort || 5060 == nPort)
+	{
+		nPort = 8000; // zeno device port
+	}
+
+	// 设备登录参数，包括设备地址、登录用户、密码等
+	ZLNET_LOGIN_PARAM struLoginInfo;
+	memset(&struLoginInfo, 0, sizeof(ZLNET_LOGIN_PARAM));
+	struLoginInfo.nLoginMode = ZLNET_LOGINMODE_TCP; 
+	struLoginInfo.nPort = nPort;
+	strcpy_s(struLoginInfo.szIP, ZLNET_MAX_IP_LEN, (char*)strDevIP.c_str());
+	strcpy_s(struLoginInfo.szUser, ZLNET_USER_NAME_64, (char*)strUserName.c_str());
+	strcpy_s(struLoginInfo.szPass, ZLNET_USER_PSW_64, (char*)strPassword.c_str());
+
+	// 输出参数：设备信息，错误信息
+	ZLNET_DEVICEINFO_V30 struDeviceInfo;
+	ZLNET_LOGIN_ERROR struErrorInfo;
+	memset(&struDeviceInfo, 0, sizeof(ZLNET_DEVICEINFO_V30));
+	memset(&struErrorInfo, 0, sizeof(ZLNET_LOGIN_ERROR));
+
+	lUserID = ZLNET_Login_V30(&struLoginInfo, &struErrorInfo, &struDeviceInfo);
+	int nerr = ZLNET_GetLastError();
+
+	// 登录设备成功之后，创建一个设备对象，并生成一个设备句柄绑定该对象
+	if (lUserID != 0)
+	{
+		CDeviceItem *pNewItem = new CDeviceItem((char*)strDevIP.c_str(), nPort, (char*)strUserName.c_str(),
+			(char*)strPassword.c_str(), strDeviceID, lUserID, &struDeviceInfo);
+		// 生成设备句柄，为后面设备操作调用
+		pNewItem->AddRef();
+		{
+			CAutoCriticalSection autolock(g_lockHandleDevice);
+			pNewItem->m_hHandle = g_HandleDevice.UseHandle((void*)pNewItem); // 设备对象句柄
+			*ppDeviceItem = pNewItem;
+		}
+
+		if (g_invoker == APServer)
+		{
+			// do something
+		}
+
+		//pNewItem->m_strDevIP = "";
+		pNewItem->m_lLoginHandle = lUserID;
+		pNewItem->m_bIsOnline = TRUE;
+		pNewItem->m_struDevInfo = struDeviceInfo;
+
+		// 回调给上层
+		LONG lHandle = pNewItem->GetHandle();
+		std::string strIP = strDevIP;
+
+		std::async([=]()
+		{
+			Sleep(100);
+			Json::Value status;
+			status[EXCPTION_EVENT] = EXCPTION_STATUS;
+			status[EXCPTION_STATUS] = EXCPTION_ONLINE;
+			status[EXCPTION_HANDLE] = lHandle;
+			std::string strMessage = status.toStyledString();
+			if (g_pExceptionCallBack)
+			{
+				g_pExceptionCallBack(DLL_TAG, (char*)strMessage.c_str(), g_pUser);
+			}
+			LOG_INFO("OnstatusUpdate %s %s, item=%p", strIP.c_str(), strMessage.c_str(), pNewItem);
+		});
+
+		return S_OK;
+	}
+	else
+	{
+		LOG_INFO("ZLNET_Login_V30: %s failed. Error = %d.", strDevIP.c_str(), struErrorInfo.nError);
+		switch (struErrorInfo.nError)
+		{
+		case ZLNET_LOGIN_ERROR_PASSWORD:
+		case ZLNET_LOGIN_ERROR_USER:
+		case ZLNET_USER_FLASEPWD:
+		case ZLNET_USER_NOMATCHING:
+			lResult = INFI_ERROR_DEVICE_NOAUTHORITY;
+			break;
+		case ZLNET_LOGIN_ERROR_TIMEOUT:
+			lResult = INFI_ERROR_DEVICE_TIMEOUT;
+		default:
+			break;
+		}
+		return S_FALSE;
+	}
+}
+
+void CDeviceItem::CloseDevice(LONG hHandle)
+{
+	CDeviceItem *pDeviceItem = NULL;
+	{
+		CAutoCriticalSection autolock(g_lockHandleDevice);
+		pDeviceItem = (CDeviceItem*)g_HandleDevice.GetHandleValue(hHandle);
+		g_HandleDevice.FreeHandle(hHandle);
+	}
+
+	if (pDeviceItem != NULL)
+	{
+//		LOG_INFO("Zeno CloseDevice: %s %d", pDeviceItem->m_strDevIP.c_str(), pDeviceItem->m_hHandle);
+	}
+
+	if (g_invoker == APServer)
+	{
+		// do something 
+	}
+	SAFE_RELEASE(pDeviceItem);
+}
+
+LONG CDeviceItem::GetDevice(LONG hHandle, CDeviceItem** ppDeviceItem)
+{
+	CDeviceItem *pDeviceItem = NULL;
+	CAutoCriticalSection autolock(g_lockHandleDevice);
+	pDeviceItem = (CDeviceItem *)g_HandleDevice.GetHandleValue(hHandle);
+	if (pDeviceItem)
+	{
+		pDeviceItem->AddRef();
+		*ppDeviceItem = pDeviceItem;
+		return S_OK;
+	}
+	else
+	{
+		return S_FALSE; // 句柄无效
+	}
+}
+
+// @brief 切分屏、切视频
+// @szParam : 切屏信息
+bool CDeviceItem::SwitchDecoder(const std::string &szParam)
+{
+	std::string strCameraID, strCmdType, strStreamType, strScreenIndex, strCameraIP;
+	std::string strStreamServerUrl, strServerIp;   //流媒体服务器地址 
+	std::string strScreenID;                       //屏幕ID 
+	int nServerPort;
+	int nScreenMode = 0;   //分屏模式 1.4.9.16.etc
+	int nScreenIndex = 0;  //分屏序号 1开始
+
+	ZLNET_NVD_VIDEO_SRC *pVideoSrc = new ZLNET_NVD_VIDEO_SRC; //视频源队列
+	ZLNET_NVD_SCENE *pNewScene = new ZLNET_NVD_SCENE;         //新NVD上墙场景
+	ZLNET_NVD_SCENE *pOldScene = new ZLNET_NVD_SCENE;         //原NVD上墙场景
+	memset(pOldScene, 0, sizeof(ZLNET_NVD_SCENE));
+	memset(pVideoSrc, 0, sizeof(ZLNET_NVD_VIDEO_SRC));
+	memset(pNewScene, 0, sizeof(ZLNET_NVD_SCENE));
+
+	Json::Reader reader;
+	Json::Value valueList;
+	if (reader.parse(szParam, valueList))
+	{
+		BOOL bRet = ZLNET_NVD_GetMatrixCfg(m_lLoginHandle, 0, m_pMatrixCfg);
+
+		strScreenID = valueList[DECODER_SCREEN_ID].asString();
+		int nCount =  valueList[DECODER_COMMANDLIST].size();
+		for (int i = 0; i < nCount; ++i)
+		{
+			const Json::Value &val = valueList[DECODER_COMMANDLIST][i];
+			// osd模式设置，跳过该次循环
+			if (val[DECODER_CMD_TYPE].asString() == DECODER_SETOSD)
+				continue;
+			// 取屏幕场景
+			if (!ZLNET_NVD_GetScene(m_lLoginHandle, /*(char*)strScreenID.c_str()*/"1", pOldScene))
+			{
+				int n = ZLNET_GetLastError();
+				LOG_INFO("ZLNET_NVD_GetScene failed. error: %d", ZLNET_GetLastError());
+				
+			}
+
+			for (int i = 0; i < pOldScene->nWindowNum; ++i)
+			{
+				if (pOldScene->stWindows[i].videos.nVideoNum != 0)
+				{
+					auto pairInsert = mapVideoSrc.insert(std::make_pair(i + 1, pOldScene->stWindows[i].videos));
+					if (pairInsert.second == false)
+					{
+						mapVideoSrc[i + 1] = pOldScene->stWindows[i].videos;
+					}
+				}
+			}
+			
+			// 设置布局场景信息
+			if (val[DECODER_CMD_TYPE].asString() == DECODER_SETLAYOUT ||
+				val[DECODER_CMD_TYPE].asString() == DECODER_SWITCH_VIDEO)      
+			{  
+				nScreenMode = atoi(val[DECODER_SCREEN_MODE].asString().c_str());
+				if (pOldScene->nWindowNum != nScreenMode)
+				{
+					//SetSceneWnd(pNewScene, nRow, nCol);
+					setScreenPos(pOldScene, nScreenMode, pNewScene);
+
+					// 把旧窗口的视频源保存到新场景对应窗口中
+					for (int i = 0; i < nScreenMode; ++i)
+					{
+						for (auto iter = mapVideoSrc.begin(); iter != mapVideoSrc.end(); ++iter)
+						{
+							if (iter->first == i + 1)
+							{
+								pNewScene->stWindows[i].videos = iter->second;
+								break;
+							}
+						}
+					}
+				}
+				else // 分屏模式不变时，场景信息不变
+				{
+					*pNewScene = *pOldScene;
+				}
+
+				if (val[DECODER_CMD_TYPE].asString() == DECODER_SWITCH_VIDEO)
+				{
+					strStreamServerUrl = val[DECODER_STREAM_SERVER_URL].asString();
+					strCameraID = val[DECODER_CAMERAID].asString();
+					strStreamType = val[DECODER_STREAM_TYPE].asString();
+					strScreenIndex = val[DECODER_SCREEN_INDEX].asString();
+					nScreenIndex = atoi(val[DECODER_SCREEN_INDEX].asString().c_str());
+
+					if (strcmp(strCameraID.c_str(), "") != 0)
+					{
+						parseSmtUrl((char*)strStreamServerUrl.c_str(), strServerIp, nServerPort);
+						
+						if (strcmp(strStreamType.c_str(), "major") == 0)
+						{
+							pVideoSrc->videoInfo[0].nStreamType = 0;
+						}
+						else if (strcmp(strStreamType.c_str(), "minor") == 0)
+						{
+							pVideoSrc->videoInfo[0].nStreamType = 1; 
+						}
+						else
+						{
+							pVideoSrc->videoInfo[0].nStreamType = 2;
+						}
+
+						// 填充当前窗口视频源信息体
+						strCameraIP = val["deviceIp"].asString();
+						pVideoSrc->nVideoNum = 1;
+						pVideoSrc->videoInfo[0].nProtocol = ZLNET_PROTOCOL_TYPE_RTSP;
+						pVideoSrc->videoInfo[0].nPlayTime = 1200; // [5,1200]
+						strncpy(pVideoSrc->videoInfo[0].szUser, "admin", ZLNET_USER_NAME_LENGTH_EX);
+						strncpy(pVideoSrc->videoInfo[0].szPasswd, "admin", ZLNET_USER_NAME_LENGTH_EX);
+						
+						// 接入协议为rtsp，需要传入rtsp url.
+						std::string strRtspPath = format("rtsp://%s:%d/%s_%s.%s",
+							strServerIp.c_str(), nServerPort, strCameraID.c_str(), strStreamType.c_str(), "sdp");
+						
+						strncpy(pVideoSrc->videoInfo[0].szIP, strRtspPath.c_str(), 128);
+
+						pNewScene->stWindows[nScreenIndex - 1].videos = *pVideoSrc;
+						pNewScene->nInterval = 1200;
+					}
+					else
+					{
+						pNewScene->stWindows[nScreenIndex - 1].videos = *pVideoSrc;
+						mapVideoSrc.erase(nScreenIndex);
+						pNewScene->nInterval = 1000;
+					}
+				}
+
+				bool bRet = ZLNET_NVD_SetScene(m_lLoginHandle, "1", pNewScene);
+				
+				if (!bRet)
+				{
+					//LOG_INFO("ZLNET_NVD_SetScene failed. error: %d", ZLNET_GetLastError());
+					int err = ZLNET_GetLastError();
+					return false;
+				}
+			}
+		}
+
+		INF_Free((LPSTR)pVideoSrc);
+		INF_Free((LPSTR)pOldScene);
+		INF_Free((LPSTR)pNewScene);
+
+		return true;
+	}
+
+	return false;
+}
+
+bool CDeviceItem::parseSmtUrl(const char *serverUrl, std::string &serverIp, int &port)
+{
+	do
+	{
+		const char *prefix = "smt://";
+		const unsigned prefixLength = 6;
+		if (_strnicmp(serverUrl, prefix, prefixLength) != 0)
+		{
+			printf("URL is not of the form \"%s\"", *prefix);
+			break;
+		}
+
+		const unsigned parseBufferSize = 100;
+		char parseBuffer[parseBufferSize];
+		const char *from = &serverUrl[prefixLength];
+
+		char *to = &parseBuffer[0];
+		unsigned nLen = 0;
+		unsigned i;
+		for (i = 0; i < parseBufferSize; ++i)
+		{
+			if(*from == '\0' || *from == ':' || *from == '/')
+			{
+				// we've completed parsing the server ip. 
+				*to = '\0';
+				break;
+			}
+			*to++ = *from++;
+			nLen++;
+		}
+
+		if (i == parseBufferSize)
+		{
+			break; //url is too long
+		}
+
+		strncpy((char*)serverIp.c_str(), parseBuffer, nLen + 1);
+		port = 554; //default port
+		
+		return true;
+	} while (0);
+
+	return false;
+}
+
+CDeviceItem *CDeviceItem::GetItemByLoginHandle(LONG lUserID)
+{
+	CDeviceItem *pRetDeviceItem = NULL;
+	CAutoCriticalSection autolock(g_lockHandleDevice);
+	CHandleMapIter iter = g_HandleDevice.UsedHandleBegin();
+	while (iter != g_HandleDevice.UsedHandleEnd())
+	{
+		CDeviceItem *pItem = (CDeviceItem*)iter->second->val;
+		if (pItem->GetLoginHandle() == lUserID)
+		{
+			pRetDeviceItem = pItem;
+			pRetDeviceItem->AddRef();
+			break;
+		}
+		iter++;
+	}
+
+	return pRetDeviceItem;
+}
+
+//设置场景坐标
+void CDeviceItem::setScreenPos(ZLNET_NVD_SCENE *scene, int nScreenMode, ZLNET_NVD_SCENE *pNewScene)
+{
+	if (m_pMatrixCfg->nVirtualNumber != 0)
+	{
+		int nRowVirtual = sqrt(m_pMatrixCfg->nVirtualNumber); 	//虚拟屏的长、宽
+		int nColVirtual = sqrt(m_pMatrixCfg->nVirtualNumber);
+		long lVirWidth = MAX_MATRIX_WIDTH / nColVirtual;
+		long lVirHeight = MAX_MATRIX_HEIGHT / nRowVirtual;
+
+		long lWndWidth = lVirWidth / sqrt(nScreenMode);
+		long lWndHeight = lVirHeight / sqrt(nScreenMode);
+
+		if (nScreenMode >= 128)
+		{
+			nScreenMode = 128;
+		}
+
+		pNewScene->nWindowNum = nScreenMode;
+		int nIndex = 0;
+		for (int i = 0; i < sqrt(nScreenMode); i++)
+		{
+			if (nIndex > 128)
+			{
+				break;
+			}
+
+			for (int j = 0; j < sqrt(nScreenMode); j++)
+			{
+				pNewScene->stWindows[nIndex].nWndIndex = nIndex + 1;
+				pNewScene->stWindows[nIndex].nPriority = 1;
+				pNewScene->stWindows[nIndex].nZOrder = 1;
+				pNewScene->stWindows[nIndex].stPosition.left = scene->stWindows[0].stPosition.left + lWndWidth * j;
+				pNewScene->stWindows[nIndex].stPosition.top = scene->stWindows[0].stPosition.top + lWndHeight * i;
+				pNewScene->stWindows[nIndex].stPosition.bottom = scene->stWindows[0].stPosition.top + lWndHeight * (i + 1);
+				pNewScene->stWindows[nIndex].stPosition.right = scene->stWindows[0].stPosition.left + lWndWidth * (j + 1);
+
+				nIndex++;
+			}
+		}
+	}
+	else
+		return;
+}
+
+// 设置窗口信息
+void CDeviceItem::SetSceneWnd(ZLNET_NVD_SCENE *ZLScene, int Row, int Col)
+{
+	long widght = 8192.0 / Col;  // 每个窗口的长和宽
+	long hight = 8192.0 / Row;
+	if (ZLScene->nWindowNum > 128) // 最多支持开128个窗口
+	{
+		ZLScene->nWindowNum = 128;
+	}
+
+	// 设置每个分屏窗口的信息
+	int nIndex = 0;
+	for (int i = 0; i < Row; i++)
+	{
+		if (nIndex >= 128)
+		{
+			break;
+		}
+
+		for (int j = 0; j < Col; j++)
+		{
+			ZLScene->stWindows[nIndex].nWndIndex = nIndex + 1;      // 窗口号从1开始
+			ZLScene->stWindows[nIndex].nPriority = 1;
+			ZLScene->stWindows[nIndex].nZOrder = 1;
+			ZLScene->stWindows[nIndex].stPosition.top = hight * i;  // 窗口在屏幕中的左上角顶点坐标
+			ZLScene->stWindows[nIndex].stPosition.left = widght * j;
+
+			int nBottom = hight * (i + 1); // 窗口在屏幕中的右下顶点坐标
+			int nRight = widght * (j + 1);
+			if (i == Row - 1)  // 最后一个窗口
+			{
+				nBottom = 8192;
+			}
+			if (j == Col - 1)
+			{
+				nRight = 8192;
+			}
+
+			ZLScene->stWindows[nIndex].stPosition.bottom = nBottom;
+			ZLScene->stWindows[nIndex].stPosition.right = nRight;
+
+			nIndex++;
+		}
+	}
+	
+}
+
+// 登录设备时初始化
+void CDeviceItem::SetOutCfg(void)
+{
+	// 取物理配置
+	m_pVideoCfg = new ZLNET_NVD_VIDEOOUT_CFG;
+	memset(m_pVideoCfg, 0, sizeof(ZLNET_NVD_VIDEOOUT_CFG));
+
+	if (!ZLNET_NVD_GetVideoOutCfg(m_lLoginHandle, m_pVideoCfg, 3000)) // 默认超时时间3s
+	{
+		LOG_INFO("%s failed. error:%d", __FUNCTION__, ZLNET_GetLastError());
+		return;
+	}
+
+	std::map<std::string, int> m_mapCurStates;
+	for (int i = 0; i < m_pVideoCfg->nNumber; i++)
+	{
+		if (m_pVideoCfg->stMonitors[i].nCurState == 1) //可用
+		{
+			m_mapCurStates.insert(make_pair(m_pVideoCfg->stMonitors[i].szMonitorID,
+				m_pVideoCfg->stMonitors[i].nCurState));
+		}
+	}
+
+	// 取电视墙信息
+	ZLNET_NVD_MATRIX_CFG *pMatrixCfg = new ZLNET_NVD_MATRIX_CFG;
+	memset(pMatrixCfg, 0, sizeof(ZLNET_NVD_MATRIX_CFG));
+
+	if (!ZLNET_NVD_GetMatrixCfg(m_lLoginHandle, 0, pMatrixCfg, 3000))
+	{
+		LOG_INFO("%s failed. error:%d", __FUNCTION__, ZLNET_GetLastError());
+		//return;
+	}
+	else
+	{
+		ZLNET_NVD_MATRIX_CFG *pInMatrixCfg = new ZLNET_NVD_MATRIX_CFG;
+		memset(pInMatrixCfg, 0, sizeof(ZLNET_NVD_MATRIX_CFG));
+
+		memcpy(pInMatrixCfg->szName, pMatrixCfg->szName, 128);
+		pInMatrixCfg->nVirtualNumber = pMatrixCfg->nVirtualNumber;
+		for (int i = 0; i < pMatrixCfg->nVirtualNumber; i++)
+		{
+			pInMatrixCfg->stScreen[i].nBindNum = 1;
+			pInMatrixCfg->stScreen[i].stBack = pMatrixCfg->stScreen[i].stBack;
+			memcpy(pInMatrixCfg->stScreen[i].szScreenID, pMatrixCfg->stScreen[i].szScreenID, 48);
+		}
+
+		// 将虚拟屏绑定到显示器
+		// 根据获取的显示器个数来设置虚拟屏个数
+		pInMatrixCfg->nVirtualNumber = m_mapCurStates.size();
+		for (int i = 0; i < m_mapCurStates.size(); i++)
+		{
+			pInMatrixCfg->stScreen[i].nBindNum = 1;
+			strncpy(pInMatrixCfg->stScreen[i].stVideoOut[0].szMonitorID, m_pVideoCfg->stMonitors[i].szMonitorID);
+		}
+
+		if (!ZLNET_NVD_SetMatrixCfg(m_lLoginHandle, 0, pInMatrixCfg, 3000))
+		{
+			LOG_INFO("%s failed. error:%d", __FUNCTION__, ZLNET_GetLastError());
+			if (pInMatrixCfg != NULL)
+			{
+				ZLNET_NVD_SetMatrixCfg(m_lLoginHandle, 0, pInMatrixCfg, 3000);
+			}
+		}
+	}
+
+
+
+
+
+//////////////////////////////////////////
+	//取输出配置
+	if (m_pVideoCfg == NULL)
+	{
+		m_pVideoCfg = new ZLNET_NVD_VIDEOOUT_CFG;
+	}
+	BOOL bRet = ZLNET_NVD_GetVideoOutCfg(m_lLoginHandle, m_pVideoCfg);
+
+	for (int i = 0; i < m_pVideoCfg->nNumber; i++)
+	{
+		m_mapCurStates.insert(std::make_pair(m_pVideoCfg->stMonitors[i].szMonitorID,
+			m_pVideoCfg->stMonitors[i].nCurState));
+	}
+
+	if (m_pMatrixCfg == NULL)
+	{
+		m_pMatrixCfg = new ZLNET_NVD_MATRIX_CFG;
+	}
+	bRet = ZLNET_NVD_GetMatrixCfg(m_lLoginHandle, 0, m_pMatrixCfg);
+
+	char szScreenID[ZLNET_MAX_DEV_ID_LEN] = { 0 };
+	if (bRet && m_pMatrixCfg->nVirtualNumber > 0)
+	{
+		m_pMatrixCfg->nVirtualNumber = 1;
+		bRet = ZLNET_NVD_SetMatrixCfg(m_lLoginHandle, 0, m_pMatrixCfg);
+	}
+
+	for (int i = 0; i < m_pMatrixCfg->nVirtualNumber; i++)
+	{
+		m_mapVirtualNames.insert(std::make_pair(i+1, m_pMatrixCfg->stScreen[i].szName));
+	}
+	
+	for (int i = 0; i < m_pMatrixCfg->nVirtualNumber; i++)
+	{
+		strncpy(szScreenID, m_pMatrixCfg->stScreen[i].szScreenID, ZLNET_MAX_DEV_ID_LEN);  
+		if (m_pScene == NULL)
+		{
+			m_pScene = new ZLNET_NVD_SCENE;
+		}
+		memset(m_pScene, 0, sizeof(ZLNET_NVD_SCENE));
+		m_pScene->nWindowNum = 1;
+		m_pScene->stWindows[0].nPriority = 0;
+		m_pScene->stWindows[0].nWndIndex = 1;
+		m_pScene->stWindows[0].nZOrder = 1;
+		//m_pScene->stWindows[0].stPosition = 
+		m_pScene->stWindows[0].videos.nVideoNum = 0;
+
+		BOOL bRet = ZLNET_NVD_SetScene(m_lLoginHandle, szScreenID, m_pScene);
+		if (!bRet) return;
+	}
+
+	/*
+	struVideoOut.nNumber = 2; // 物理屏有效个数
+	strncpy(struVideoOut.stMonitors[0].szMonitorID, "0:0", 48); // 物理屏输出设置
+	strncpy(struVideoOut.stMonitors[1].szMonitorID, "0:1", 48); 
+	for (int i = 0; i < 2; ++i)
+	{
+		strncpy(struVideoOut.stMonitors[i].szName, m_strDevIP.c_str(), 48); 
+		struVideoOut.stMonitors[i].rcMargin = { 0, 0, 0, 0 };
+		//struVideoOut.stMonitors[i].stBack.stColor = { 0, 0, 0, 0 };
+		struVideoOut.stMonitors[i].stColor = { 33, 56, 61, 50, 0, 0, 0 };
+		struVideoOut.stMonitors[i].stMode = { 1280, 1024, 0, 60, 0 };
+		struVideoOut.stMonitors[i].nCurState = 1;
+	}
+
+	if (!ZLNET_NVD_SetVideoOutCfg(m_lLoginHandle, &struVideoOut))
+	{
+		LOG_INFO("ZLNET_NVD_SetVideoOutCfg failed. error: %d.", ZLNET_GetLastError());
+		return S_FALSE;
+	}*/
+	
+	// 虚拟屏设置
+	ZLNET_NVD_MATRIX_CFG struMatrixCfg;
+	memset(&struMatrixCfg, 0, sizeof(ZLNET_NVD_MATRIX_CFG));
+	
+	strncpy(struMatrixCfg.szName, "abcde", ZLNET_MAX_STRING_LEN);
+	struMatrixCfg.nVirtualNumber = 1;
+	struMatrixCfg.stScreen[0].stRect = { 0, 0, 8192, 8192 };
+	struMatrixCfg.stScreen[0].nBindNum = 1;
+	struMatrixCfg.stScreen[0].stVideoOut[0].stRect = { 0, 0, 8192, 8192 };
+	strncpy(struMatrixCfg.stScreen[0].szScreenID, "1", 48);
+	strncpy(struMatrixCfg.stScreen[0].szName, "test", 48);        // 
+	strncpy(struMatrixCfg.stScreen[0].stVideoOut[0].szMonitorID,  // 将虚拟屏与物理屏绑定 
+		/*struVideoOut.stMonitors[0].szMonitorID*/"0:1", 48);
+	
+	if (!ZLNET_NVD_SetMatrixCfg(m_lLoginHandle, 0, &struMatrixCfg))
+	{
+		DWORD err = ZLNET_GetLastError();
+			LOG_INFO("ZLNET_NVD_SetMatrixCfg failed. error: %d", err);
+		return;
+	}
+
+}
+
+// ========================= 平台相关 ============================
+LONG CDeviceItem::OpenPlatform(LONG lDeviceHandle, LPCSTR szParam, LONG *plPlatformHandle)
+{
+	CDeviceItem *pDeviceItem = NULL;
+	if (CDeviceItem::GetDevice(lDeviceHandle, &pDeviceItem) != S_OK)
+	{
+		LOG_INFO("OpenPlatform failed. No device got.");
+		return S_FALSE;
+	}
+
+	CPlatformItem *pPlatformItem = new CPlatformItem(pDeviceItem);
+	{
+		CAutoCriticalSection autolock(g_lockPlatform);
+		*plPlatformHandle = g_mapPlatform.UseHandle((void*)pPlatformItem);
+		pDeviceItem->Release();  ////// 原因？
+	}
+
+	return S_OK;
+}
+
+// 传入平台句柄，关闭平台
+void CDeviceItem::ClosePlatform(LONG lPlatformHandle)
+{
+	CPlatformItem *pPlatform = NULL;
+	{
+		CAutoCriticalSection autolock(g_lockPlatform);
+		pPlatform = (CPlatformItem*)g_mapPlatform.GetHandleValue(lPlatformHandle);
+		g_mapPlatform.FreeHandle(lPlatformHandle);
+	}
+	if (pPlatform)
+	{
+		SAFE_DELETE(pPlatform);
+	}
+}
+
+bool CDeviceItem::GetPlatform(LONG lPlatformHandle, CPlatformItem **ppPlatformItem)
+{
+	if (ppPlatformItem == NULL)
+	{
+		return false;
+	}
+	CPlatformItem *pPlatformItem = NULL;
+	CAutoCriticalSection autolock(g_lockPlatform);
+	pPlatformItem = (CPlatformItem*)g_mapPlatform.GetHandleValue(lPlatformHandle);
+	if (pPlatformItem)
+	{
+		*ppPlatformItem = pPlatformItem;
+		return true;
+	}
+
+	return false;
+}
+
+void CDeviceItem::RegistePlatform(CPlatformItem *pPlatform)
+{
+	CAutoCriticalSection autolock(m_lockPlatform);
+	m_listPlatform.push_back(pPlatform);
+}
+
+void CDeviceItem::UnRegistePlatform(CPlatformItem *pPlatform)
+{
+	CAutoCriticalSection autolock(m_lockPlatform);
+	m_listPlatform.remove(pPlatform);
+}
+
+// 传入一个设备对象和，返回response和channelSize
+void CDeviceItem::GetResources(CDeviceItem *pDeviceItem, Json::Value &response, int &channelSize)
+{
+	channelSize = 0;
+	{
+		CAutoCriticalSection autolock(m_lockMapChannelInfo);
+		m_mapChannels.clear();
+	}
+	GetChannelResources(response, channelSize);
+}
+
+// @param [out]value，通道信息
+// @param [out]channelSize，通道数
+void CDeviceItem::GetChannelResources(Json::Value &value, int &channelSize)
+{
+	GetChannelName(); // 获取通道名，保存到m_mapChannelName中
+	GetChannelInfo(); // 获取通道信息，保存在m_mapChannels中
+
+	// 遍历通道，封装打包多个通道信息，保存到value中
+	Json::Value arrayValue;
+
+	CAutoCriticalSection autolock(m_lockMapChannelInfo);
+	for (auto iter = m_mapChannels.begin(); iter != m_mapChannels.end(); iter++)
+	{
+		DEVICE_RESOURCES_INFO details = iter->second;
+
+		arrayValue[KEY_DOMAIN_CODE] = m_strDeviceID;
+		arrayValue[KEY_PARENT_ID] = m_strDeviceID;
+		arrayValue[KEY_SOURCE_ID] = "";
+		arrayValue[KEY_PTZ_TYPE] = "";
+		arrayValue[KEY_OPERATE_TYPE] = KEY_CMD_ADD;
+		arrayValue[KEY_CHANNEL_ID] = details.strID;
+		arrayValue[KEY_SOURCE_NAME] = details.strName;
+		arrayValue[KEY_ADDRESS] = details.strIpAddresses;
+		arrayValue[KEY_SOURCE_TYPE] = details.strResType;
+		arrayValue[KEY_SOURCE_STATUS] = details.strChannelState;
+
+		value[KEY_CHANNEL_ARRAY].append(arrayValue); // 该字段保存多个通道信息
+		arrayValue.clear();
+	}
+
+	if (value[KEY_CHANNEL_ARRAY].isArray())
+	{
+		channelSize = value[KEY_CHANNEL_ARRAY].size();
+	}
+	else
+	{
+		channelSize = 0;
+	}
+}
+
+// 获取通道号、通道名、类型、状态
+void CDeviceItem::GetChannelInfo()
+{
+	ZLNET_NVD_VIDEOOUT_CFG struVideoCfg;
+	memset(&struVideoCfg, 0, sizeof(ZLNET_NVD_VIDEOOUT_CFG));
+
+	if (!ZLNET_NVD_GetVideoOutCfg(m_lLoginHandle, &struVideoCfg, 3000))
+	{
+		LOG_INFO("ZLNET_NVD_VIDEOOUT_CFG failed. error: %d.", ZLNET_GetLastError());
+		return;
+	}
+
+	// 信息分析、打包、存放
+	int nMonitorNum = struVideoCfg.nNumber;
+	int nChannel = 0;
+	int nChannelUsed = 0;
+	int nStatus = STATUS_OFF;
+	bool bIsStatusChannel = false;
+	std::string strStatus;
+
+	for (int i = 0; i < nMonitorNum; ++i)
+	{
+		if (struVideoCfg.stMonitors[i].nCurState == 1)
+		{
+			nStatus = STATUS_ON;
+		}
+		else
+		{
+			nStatus = STATUS_OFF;
+		}
+		strStatus = nStatus == 1 ? "on" : "off";
+
+		std::string strChannelName = struVideoCfg.stMonitors[nMonitorNum].szName;
+		nStatus = struVideoCfg.stMonitors[nMonitorNum].nCurState;
+
+		DEVICE_RESOURCES_INFO resourceInfo;
+		memset(&resourceInfo, 0, sizeof(DEVICE_RESOURCES_INFO));
+		// 信息填充
+		resourceInfo.strResType = SOURCE_TYPE_Names[enumSOURCE_TYPE::Monitor]; 
+		resourceInfo.strName = strChannelName;
+		resourceInfo.strChannelState = strStatus;
+		resourceInfo.strIpAddresses = "";
+		resourceInfo.strID = struVideoCfg.stMonitors[i].szMonitorID;
+		resourceInfo.rcMargin = struVideoCfg.stMonitors[i].rcMargin;
+		resourceInfo.stBack = struVideoCfg.stMonitors[i].stBack;
+		resourceInfo.stColor = struVideoCfg.stMonitors[i].stColor;
+		resourceInfo.stMode = struVideoCfg.stMonitors[i].stMode;
+
+		m_mapChannels.insert(make_pair(to_string(i), resourceInfo));  // 通道ID和通道信息
+	}
+}
+
+void CDeviceItem::GetChannelName()
+{
+	CAutoCriticalSection autolock(m_lockMapChannelName);
+	m_mapChannelName.clear(); 
+
+	ZLNET_NVD_VIDEOOUT_CFG struCfg;
+	memset(&struCfg, 0, sizeof(ZLNET_NVD_VIDEOOUT_CFG));
+
+	if (!ZLNET_NVD_GetVideoOutCfg(m_lLoginHandle, &struCfg, 3000)) // 默认超时时间3s
+	{
+		LOG_INFO("ZLNET_NVD_GetVideoOutCfg failed. error: %d.", ZLNET_GetLastError());
+		return;
+	}
+
+	// 保存通道名到表中，键值对：stMonitor序号--stMonitor名称
+	std::string strChannelName;
+	int nChannelNum = struCfg.nNumber; // 显示器数量
+	for (int i = 0; i < nChannelNum; ++i)
+	{
+		strChannelName = (char*)struCfg.stMonitors[i].szName; // 物理屏即通道
+		m_mapChannelName.insert(make_pair(to_string(i), strChannelName));
+	}
+}
+
+// 从控设备管理
+void CDeviceItem::SearchSlaveDev(std::string szParam, LPSTR *lpszBuffer, int *nBuffer)
+{
+	ZLNET_NVD_SEARCH_RESULT *pBuf = new ZLNET_NVD_SEARCH_RESULT[MAX_NVD_COUNT];
+	memset(pBuf, 0, sizeof(ZLNET_NVD_SEARCH_RESULT) * MAX_NVD_COUNT);
+
+	int nRetCount = 0;
+	if (!ZLNET_NVD_SearchDev(m_lLoginHandle, pBuf, MAX_NVD_COUNT, nRetCount, 5000))
+	{
+		LOG_INFO("ZLNET_NVD_SearchDev falied. error: %d.", ZLNET_GetLastError());
+		return;
+	}
+
+	int nCount = nRetCount;
+	Json::Value valueArray;
+
+	for (int i = 0; i < nCount; ++i)
+	{
+		ZLNET_NVD_SEARCH_RESULT *pInfo = pBuf + i;
+
+		valueArray[SLAVE_MAC] = pInfo->szMAC;
+		valueArray[SLAVE_IP] = pInfo->szIP;
+		valueArray[SLAVE_PORT] = pInfo->nPort;
+		valueArray[SLAVE_WEBPORT] = pInfo->nWebPort;
+		valueArray[SLAVE_DEV_TYPE] = pInfo->szDevType;
+		
+		m_value[DECODER_DEV_INFO_ARRAY].append(valueArray);
+		valueArray.clear();
+	}
+
+	if (m_value[DECODER_DEV_INFO_ARRAY].isArray())
+	{
+		m_deviceCount = m_value[DECODER_DEV_INFO_ARRAY].size();
+	}
+	else
+	{
+		m_deviceCount = 0;
+	}
+
+	std::string strResponse = m_value.toStyledString();
+
+	*lpszBuffer = new char[strResponse.length() + 1];
+	std::memcpy(*lpszBuffer, strResponse.c_str(), strResponse.size());
+	LOG_INFO("获取资源信息， %s", strResponse.c_str());
+
+	(*lpszBuffer)[strResponse.length()] = '\0';
+	*nBuffer = strResponse.length() + 1;
+
+	INF_Free((LPSTR)pBuf);
+}
+
+void CDeviceItem::NotifySlaveDev(LPCSTR szParam)
+{
+	Json::Reader reader;
+	Json::Value jsonValue;
+	Json::Value value;
+
+	if (reader.parse(szParam, value))
+	{
+		std::string strOperateType = value[SLAVE_OPERATOR_TYPE].asString();
+		int nCount = jsonValue.size();
+		for (int i = 0; i < nCount; ++i)
+		{
+			std::string strSlaveId = jsonValue[i][SLAVE_ID].asString();
+			string strNodeId = "";
+			std::map<std::string, std::string>::iterator iter;
+			if (strcmp(strOperateType.c_str(), "add") != 0)
+			{
+				iter = m_mapSlaveId.find(strSlaveId);
+				if (iter == m_mapSlaveId.end())
+				{
+					LOG_ERROR("%s fail, can't find slave device, SlaveId is %s", strOperateType.c_str(), strSlaveId.c_str());
+					continue;
+				}
+				strNodeId = iter->second;
+			}
+
+			if (strcmp(strOperateType.c_str(), "add") == 0)
+			{
+				AddSlaveDev(jsonValue[i].toStyledString());
+			}
+			else if (strcmp(strOperateType.c_str(), "delete") == 0)
+			{
+				if (DeleteSlaveDev((char*)strNodeId.c_str()))
+				{
+					m_mapSlaveId.erase(iter);
+				}
+			}
+			else if (strcmp(strOperateType.c_str(), "update") == 0)
+			{
+				ModifySlaveDev((char*)strNodeId.c_str(), jsonValue[i].toStyledString().c_str());
+			}
+		}
+	}
+	else
+	{
+		LOG_ERROR("Notify slave device fail, Parse json data fail, Msg is %s", szParam);
+	}
+}
+
+void CDeviceItem::AddSlaveDev(std::string szParam)
+{
+	m_strNodeInfo = szParam;
+
+	std::async(std::launch::async, [this](){
+		std::string strDeviceId; // 解码器设备ID
+		std::string strSlaveId;
+		std::string strIP;
+		std::string strUser;
+		std::string strPasswd;
+		int nPort;
+		int nWebPort;
+		int nCountAdd;
+
+		Json::Reader reader;
+		Json::Value value;
+		Json::Value response;
+
+		if (reader.parse(m_strNodeInfo, value))
+		{
+			ZLNET_NVD_NODE node;
+			ZLNET_NVD_NODE_ERROR errCode = ZLNET_NVDNODE_UNKNOWN;
+			char szID[ZLNET_MAX_DEV_ID_LEN] = { 0 };
+
+			strDeviceId = value[DECODER_DEVICE_ID].asString();
+
+			if (value[DECODER_DEV_INFO_ARRAY].isArray())
+			{
+				nCountAdd = value[DECODER_DEV_INFO_ARRAY].size();
+			}
+
+			Json::Value jsonArray;
+			Json::Value val;
+
+			strSlaveId = value[SLAVE_ID].asString();
+			strIP = value[SLAVE_IP].asString();
+			strUser = value[SLAVE_USERNAME].asString();
+			strPasswd = value[SLAVE_PASSWORD].asString();
+			nPort = value[SLAVE_PORT].asInt();
+			nWebPort = value[SLAVE_WEBPORT].asInt();
+
+			memset(&node, 0, sizeof(ZLNET_NVD_NODE));
+			strcpy(node.szIP, strIP.c_str());
+			strcpy(node.szUser, strUser.c_str());
+			strcpy(node.szPass, strPasswd.c_str());
+			node.nPort = nPort;
+			node.nWebPort = nWebPort;
+
+			if (ZLNET_NVD_AddNode(m_lLoginHandle, &node, szID, ZLNET_MAX_DEV_ID_LEN, &errCode))
+			{
+				val[SLAVE_ID] = strSlaveId.c_str();
+				val[SLAVE_ERROR] = errCode;
+
+				{
+					CAutoCriticalSection autolock(m_lockMapSlaveId);
+					m_mapSlaveId.insert(std::make_pair(strSlaveId, szID));
+				}
+			}
+			else
+			{
+				val[SLAVE_ID] = strSlaveId.c_str();
+				val[SLAVE_ERROR] = ZLNET_NVDNODE_UNKNOWN;
+				LOG_INFO("ZLNET_NVD_AddNode failed. error:%d", errCode);
+			}
+
+			response[SLAVE_INFO_ARRAY].append(val);
+			val.clear();
+
+			std::string strMessage = response.toStyledString();
+			if (m_pSlaveCallback)
+			{
+				m_pSlaveCallback(DLL_TAG, (char*)strMessage.c_str(), m_pUser);
+			}
+			LOG_INFO("OnstatusUpdate %s %s, item=%p", strIP.c_str(), strMessage.c_str(), this);
+		}
+		else
+		{
+			LOG_INFO("AddSlaveDev failed. Error: parse param error.");
+		}
+	});
+}
+
+bool CDeviceItem::DeleteSlaveDev(LPSTR szNodeId)
+{
+	if (!ZLNET_NVD_DelNode(m_lLoginHandle, szNodeId))
+	{
+		LOG_INFO("ZLNET_NVD_DelNode failed. error:%d", ZLNET_GetLastError());
+		return false;
+	}
+	return true;
+}
+
+void CDeviceItem::ModifySlaveDev(LPSTR szNodeId, LPCSTR szParam)
+{
+	std::string strIP;
+	std::string strUser;
+	std::string strPasswd;
+	int nPort;
+	int nWebPort;
+	string strSlaveId;
+
+	ZLNET_NVD_NODE node;
+	memset(&node, 0, sizeof(ZLNET_NVD_NODE));
+
+	Json::Reader reader;
+	Json::Value value;
+	if (reader.parse(szParam, value))
+	{
+		strIP = value[SLAVE_IP].asString();
+		strUser = value[SLAVE_USERNAME].asString();
+		strPasswd = value[SLAVE_PASSWORD].asString();
+		nPort = value[SLAVE_PORT].asInt();
+		nWebPort = value[SLAVE_WEBPORT].asInt();
+		strSlaveId = value[SLAVE_ID].asString();
+
+		std::memcpy(node.szIP, (char*)strIP.c_str(), strIP.size());
+		std::memcpy(node.szUser, (char*)strUser.c_str(), strUser.size());
+		std::memcpy(node.szPass, (char*)strPasswd.c_str(), strPasswd.size());
+		node.nPort = nPort;
+		node.nWebPort = nWebPort;
+
+		if (!ZLNET_NVD_ModifyNode(m_lLoginHandle, szNodeId, &node))
+		{
+			LOG_INFO("ZLNET_NVD_ModifyNode failed. error:%d", ZLNET_GetLastError());
+		}
+		// 获取节点状态
+		ZLNET_NVD_ALLNODE_STATE *pState = new ZLNET_NVD_ALLNODE_STATE;
+		ZLNET_NVD_NODE_ERROR errCode;
+		memset(pState, 0, sizeof(ZLNET_NVD_ALLNODE_STATE));
+		memset(&errCode, 0, sizeof(ZLNET_NVD_NODE_ERROR));
+
+		if (!ZLNET_NVD_GetNodeState(m_lLoginHandle, pState))
+		{
+			LOG_INFO("ZLNET_NVD_GetNodeState failed. error:%d", ZLNET_GetLastError());
+		}
+		int num = pState->nNum;
+		Json::Value retValue, response;
+		for (int i = 0; i < num; ++i)
+		{
+			if (strcmp(szNodeId, pState->stStates[i].szNodeID) == 0)
+			{
+				retValue[SLAVE_ERROR] = pState->stStates[i].nState;
+				retValue[SLAVE_ID] = strSlaveId;
+			}
+		}
+		response[SLAVE_INFO_ARRAY].append(retValue);
+		m_pSlaveCallback(DLL_TAG, (char*)response.toStyledString().c_str(), m_pUser);
+		LOG_INFO("ZLNET_NVD_ModifyNode ok.");
+	}
+}
+
+void CDeviceItem::SlaveSetCallback(funcSlaveCallBack _pCallback, void *pUser)
+{
+	m_pSlaveCallback = _pCallback;
+	m_pUser = pUser;
+}
+
+void CDeviceItem::OnStatusUpdate()
+{
+	if (m_strDeviceID.length() == 0) return;
+	Json::Value status;
+	status[EXCPTION_URLS] = "";
+	status[EXCPTION_STATUS] = m_bIsOnline ? EXCPTION_ONLINE : EXCPTION_OFFLINE;
+	status[EXCPTION_HANDLE] = GetHandle();
+	std::string strMessage = status.toStyledString();
+	if (g_pExceptionCallBack)
+	{
+		g_pExceptionCallBack(DLL_TAG, (char*)strMessage.c_str(), g_pUser);
+	}
+	LOG_INFO("OnstatusUpdate %s %s, item=%p", m_strDevIP.c_str(), strMessage.c_str(), this);
+}
+
+void CDeviceItem::OnDeviceStatusUpdate(bool bOnline)
+{
+	Json::Value param;
+	param[EXCPTION_EVENT] = "STATUS";
+	param[EXCPTION_HANDLE] = m_hHandle;
+	param[EXCPTION_STATUS] = bOnline ? "ONLINE" : "OFFLINE";
+
+	std::string strMessage = param.toStyledString();
+	if (g_pExceptionCallBack)
+	{
+		g_pExceptionCallBack(DLL_TAG, strMessage.c_str(), g_pUser);
+	}
+	else
+	{
+		LOG_ERROR("g_pExceptionCallBack == NULL");
+	}
+	LOG_TRACE("send online message，param=%s,ip=%s", param.toStyledString().c_str(), m_strDevIP.c_str());
+}
+
+void CDeviceItem::OnDisconnect(char *pchDVRIP, LONG nDVRPort)
+{
+	m_bIsOnline = false;
+	OnStatusUpdate();
+}
+
+void CDeviceItem::OnReconnect(char *pchDVRIP, LONG nDVRPort)
+{
+	m_bIsOnline = true;
+	OnStatusUpdate();
+}
